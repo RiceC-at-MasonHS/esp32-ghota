@@ -1,0 +1,13 @@
+# Wi-Fi credentials for local USB flashing only
+ClockFirmware/secrets.h
+
+# Never commit signing keys
+*.pem
+
+# Library Manager installs land in libraries/ when the sketchbook is this
+# repo; only our own library is tracked.
+libraries/*
+!libraries/GithubReleaseOTA/
+
+build/
+dist/

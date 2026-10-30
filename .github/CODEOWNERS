@@ -1,0 +1,7 @@
+# Changes here decide who can ship firmware to every clock; require an
+# owner's review. Add co-maintainers here as the team grows.
+/.github/                          @RiceC-at-MasonHS
+/ClockFirmware/ota_keys.h          @RiceC-at-MasonHS
+/scripts/                          @RiceC-at-MasonHS
+/libraries/GithubReleaseOTA/       @RiceC-at-MasonHS
+/variants.json                     @RiceC-at-MasonHS

@@ -1,0 +1,172 @@
+# Builds every changed hardware variant, signs the manifests with the
+# production key (after a required reviewer approves), and publishes a
+# GitHub Release. Clocks pick it up in their next nightly update window.
+#
+# Trigger: push a tag vMAJOR.MINOR.PATCH that points at a commit on main.
+# Setup:   docs/GITHUB_SETUP.md
+name: Release firmware
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)release, e.g. v1.12.3"
+        required: true
+      rebuild_all:
+        description: "Rebuild every variant even if unchanged"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-release
+  cancel-in-progress: false
+
+env:
+  # Pin the core: a core upgrade changes every binary, so do it on purpose
+  # (and bump at least MINOR when you do).
+  ESP32_CORE_VERSION: "3.3.12"
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      build: ${{ steps.plan.outputs.build }}
+      carry: ${{ steps.plan.outputs.carry }}
+      prev_tag: ${{ steps.prev.outputs.prev_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
+      - name: Tag must be on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$(git rev-parse "$TAG^{commit}")" origin/main \
+            || { echo "::error::$TAG is not on main"; exit 1; }
+
+      - name: Find previous release
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prev=$(gh release view --json tagName -q .tagName 2>/dev/null || true)
+          [ "$prev" = "$TAG" ] && prev=""
+          assets=""
+          if [ -n "$prev" ]; then
+            assets=$(gh release view "$prev" --json assets -q '[.assets[].name] | join(",")')
+          fi
+          echo "prev_tag=$prev" >> "$GITHUB_OUTPUT"
+          echo "assets=$assets" >> "$GITHUB_OUTPUT"
+
+      - name: Plan variants
+        id: plan
+        run: |
+          python3 scripts/ota_release.py plan --tag "$TAG" \
+            --prev-tag "${{ steps.prev.outputs.prev_tag }}" \
+            --prev-assets "${{ steps.prev.outputs.assets }}" \
+            ${{ inputs.rebuild_all && '--rebuild-all' || '' }} >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        variant: ${{ fromJSON(needs.plan.outputs.build) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install "esp32:esp32@$ESP32_CORE_VERSION" --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+      - name: Compile ${{ matrix.variant.id }}
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          python3 scripts/ota_release.py build-info --variant "${{ matrix.variant.id }}" --version "$VERSION" \
+            > ClockFirmware/build_info.h
+          rm -f ClockFirmware/secrets.h
+          arduino-cli compile --fqbn "${{ matrix.variant.fqbn }}" --libraries libraries \
+            --warnings default --output-dir build ClockFirmware
+          mkdir -p dist
+          cp build/ClockFirmware.ino.bin "dist/clock-${{ matrix.variant.id }}-$VERSION.bin"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.variant.id }}
+          path: dist/*.bin
+          if-no-files-found: error
+
+  release:
+    needs: [plan, build]
+    if: always() && needs.plan.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-latest
+    # Required reviewers on this environment gate access to the signing key.
+    environment: production
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Sign manifests
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          BUILD: ${{ needs.plan.outputs.build }}
+        run: |
+          umask 077
+          key="$RUNNER_TEMP/ota-signing-key.pem"
+          printf '%s\n' "$OTA_SIGNING_KEY" > "$key"
+          for id in $(echo "$BUILD" | jq -r '.[].id'); do
+            bin="clock-$id-$VERSION.bin"
+            python3 scripts/ota_release.py sign --variant "$id" --version "$VERSION" \
+              --bin "dist/$bin" --key "$key" --out-dir dist \
+              --url "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$bin"
+          done
+          shred -u "$key"
+
+      - name: Carry forward unchanged variants
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREV: ${{ needs.plan.outputs.prev_tag }}
+          CARRY: ${{ needs.plan.outputs.carry }}
+        run: |
+          for id in $(echo "$CARRY" | jq -r '.[]'); do
+            gh release download "$PREV" -p "manifest-$id.txt" -D dist
+          done
+
+      - name: Verify every manifest against ota_keys.h
+        run: python3 scripts/ota_release.py verify dist/manifest-*.txt --bin-dir dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD: ${{ needs.plan.outputs.build }}
+          CARRY: ${{ needs.plan.outputs.carry }}
+        run: |
+          notes="Built: $(echo "$BUILD" | jq -r '[.[].id] | join(", ") | if . == "" then "none" else . end')
+          Unchanged (manifest carried from ${{ needs.plan.outputs.prev_tag }}): $(echo "$CARRY" | jq -r 'join(", ") | if . == "" then "none" else . end')"
+          gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes "$notes"

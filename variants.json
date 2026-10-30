@@ -1,0 +1,24 @@
+{
+  "fqbn_note": "PartitionScheme cannot change over OTA; keep min_spiffs (1.9MB app x2) for every board in the field.",
+  "ignore_paths": ["docs/", "README.md", "LICENSE", ".github/CODEOWNERS"],
+  "variants": [
+    {
+      "id": "seg7",
+      "define": "CLOCK_VARIANT_SEG7",
+      "fqbn": "esp32:esp32:esp32:PartitionScheme=min_spiffs",
+      "paths": ["ClockFirmware/src/variants/seg7/"]
+    },
+    {
+      "id": "rgb",
+      "define": "CLOCK_VARIANT_RGB",
+      "fqbn": "esp32:esp32:esp32:PartitionScheme=min_spiffs",
+      "paths": ["ClockFirmware/src/variants/rgb/"]
+    },
+    {
+      "id": "neopixel",
+      "define": "CLOCK_VARIANT_NEOPIXEL",
+      "fqbn": "esp32:esp32:esp32:PartitionScheme=min_spiffs",
+      "paths": ["ClockFirmware/src/variants/neopixel/"]
+    }
+  ]
+}
